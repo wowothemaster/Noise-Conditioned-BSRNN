@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
-# 假设 LearnableSigmoid 等在 utils 中
 from utils import *
 
-# ==========================================
-# 1. 全新升级：基于时序交叉注意力的动态条件生成器 (Temporal Reference Conditioner)
-# 解决任意长度 BEATs 样本与 BSRNN 时序的软对齐问题
-# ==========================================
+
 class TemporalReferenceConditioner(nn.Module):
     def __init__(self, text_dim=512, beats_dim=768, bsrnn_channels=128, num_heads=4):
         super(TemporalReferenceConditioner, self).__init__()
