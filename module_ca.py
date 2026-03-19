@@ -62,8 +62,7 @@ class BSRNN(nn.Module):
             nn.Linear(text_dim, num_channel),
             nn.Sigmoid()
         )
-        nn.init.zeros_(self.scene_gate[0].weight)
-        nn.init.zeros_(self.scene_gate[0].bias)
+
 
         self.audio_film = TemporalFiLMConditioner(
             beats_dim=beats_dim, 
