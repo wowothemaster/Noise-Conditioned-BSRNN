@@ -4,31 +4,38 @@ import matplotlib.pyplot as plt
 from utils import *
 
 
-class TemporalReferenceConditioner(nn.Module):
-    def __init__(self, text_dim=512, beats_dim=768, bsrnn_channels=128, num_heads=4):
-        super(TemporalReferenceConditioner, self).__init__()
+class TemporalFiLMConditioner(nn.Module):
+    def __init__(self, beats_dim=768, bsrnn_channels=128, num_heads=4):
+        super(TemporalFiLMConditioner, self).__init__()
         
-        self.text_proj = nn.Linear(text_dim, bsrnn_channels)
+        # 音频特征投影
         self.beats_proj = nn.Linear(beats_dim, bsrnn_channels)
         
-        # 跨序列注意力机制
+        # 跨序列注意力机制 (软对齐)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=bsrnn_channels, 
             num_heads=num_heads, 
             batch_first=True
         )
         
-        # 融合与门控输出
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(bsrnn_channels * 2, bsrnn_channels),
+        # FiLM 
+        self.gamma_mlp = nn.Sequential(
+            nn.Linear(bsrnn_channels, bsrnn_channels),
+            nn.SiLU(),
+            nn.Linear(bsrnn_channels, bsrnn_channels)
+        )
+        self.beta_mlp = nn.Sequential(
+            nn.Linear(bsrnn_channels, bsrnn_channels),
             nn.SiLU(),
             nn.Linear(bsrnn_channels, bsrnn_channels)
         )
         
-        nn.init.zeros_(self.fusion_mlp[-1].weight)
-        nn.init.zeros_(self.fusion_mlp[-1].bias)
+        nn.init.zeros_(self.gamma_mlp[-1].weight)
+        nn.init.zeros_(self.gamma_mlp[-1].bias)
+        nn.init.zeros_(self.beta_mlp[-1].weight)
+        nn.init.zeros_(self.beta_mlp[-1].bias)
 
-    def forward(self, f_a_seq, f_t, bsrnn_feat_time):
+    def forward(self, f_a_seq, bsrnn_feat_time):
         B, T, N = bsrnn_feat_time.shape
         
         # [B, T_beats, beats_dim] -> [B, T_beats, N]
@@ -37,36 +44,32 @@ class TemporalReferenceConditioner(nn.Module):
         # [B, T, N]
         q_target = bsrnn_feat_time
         
-        # 软寻址解决长度不匹配
-        # 目标音频的每一帧 T，都会去任意长度的 T_beats 里寻找相似的噪声片段
-        # matched_noise: [B, T, N]
         matched_noise, _ = self.cross_attn(query=q_target, key=kv_beats, value=kv_beats)
         
-        # 注入全局文本语义
-        # [B, text_dim] -> [B, 1, N] -> [B, T, N]
-        text_global = self.text_proj(f_t).unsqueeze(1).expand(-1, T, -1)
+        gamma = self.gamma_mlp(matched_noise).transpose(1, 2).unsqueeze(-1)
+        beta  = self.beta_mlp(matched_noise).transpose(1, 2).unsqueeze(-1)
         
-        # [B, T, N * 2]
-        f_combined = torch.cat([matched_noise, text_global], dim=-1)
-        
-        # [B, T, N]
-        c_extra = self.fusion_mlp(f_combined)
-        
-        return c_extra.transpose(1, 2).unsqueeze(-1)
+        return gamma, beta
 
 
 class BSRNN(nn.Module):
-    def __init__(self, num_channel=128, num_layer=6, text_dim=512, beats_dim=768):
+    def __init__(self, num_channel=128, num_layer=6, text_dim=768, beats_dim=768):
         super(BSRNN, self).__init__()
         self.num_layer = num_layer
         self.band_split = BandSplit(channels=num_channel)
 
-        self.conditioner = TemporalReferenceConditioner(
-            text_dim=text_dim, 
+        self.scene_gate = nn.Sequential(
+            nn.Linear(text_dim, num_channel),
+            nn.Sigmoid()
+        )
+        nn.init.zeros_(self.scene_gate[0].weight)
+        nn.init.zeros_(self.scene_gate[0].bias)
+
+        self.audio_film = TemporalFiLMConditioner(
             beats_dim=beats_dim, 
             bsrnn_channels=num_channel
         )
-
+        
         for i in range(self.num_layer):
             setattr(self, 'norm_t{}'.format(i + 1), nn.GroupNorm(1,num_channel))
             setattr(self, 'lstm_t{}'.format(i + 1), nn.LSTM(num_channel,2*num_channel,batch_first=True))
@@ -81,7 +84,7 @@ class BSRNN(nn.Module):
          
         # 初始化
         for m in self.modules():
-            if isinstance(m, TemporalReferenceConditioner):
+            if isinstance(m, TemporalFiLMConditioner) or m is self.scene_gate:
                 continue 
             if type(m) in [nn.LSTM]:
                 for name, param in m.named_parameters():
@@ -101,19 +104,28 @@ class BSRNN(nn.Module):
         z = self.band_split(x).transpose(1,2) 
         
         B, N, T, K = z.shape
-
-        c_extra = None
-        if f_a_seq is not None and f_t is not None:
-            # 提取时间轴动态特征作为 Query
+        
+        gate = 1.0
+        if f_t is not None:
+            gate = self.scene_gate(f_t).view(B, N, 1, 1)
+            
+        gamma, beta = None, None
+        if f_a_seq is not None:
+            # 提取时间轴动态特征作为 Query: [B, N, T, K] -> [B, N, T] -> [B, T, N]
             z_time = z.mean(dim=-1).transpose(1, 2)
-            c_extra = self.conditioner(f_a_seq, f_t, bsrnn_feat_time=z_time)
+            gamma, beta = self.audio_film(f_a_seq, bsrnn_feat_time=z_time)
 
         skip = z
         
         # 在时间维度的每一层注入
         for i in range(self.num_layer):
-            if c_extra is not None:
-                skip = skip + c_extra  
+            # 1. 文本全局门控注入 (通道筛选)
+            if f_t is not None:
+                skip = skip * gate
+                
+            # 2. 音频局部 FiLM 注入 (幅度/偏移变换)
+            if gamma is not None and beta is not None:
+                skip = skip * (1 + gamma) + beta  
             
             out = getattr(self, 'norm_t{}'.format(i + 1))(skip)
             out = out.transpose(1,3).reshape(B*K, T, N)            
@@ -124,8 +136,13 @@ class BSRNN(nn.Module):
         
         # 在频率维度的每一层注入
         for i in range(self.num_layer):
-            if c_extra is not None:
-                skip = skip + c_extra
+            # 1. 文本全局门控注入
+            if f_t is not None:
+                skip = skip * gate
+                
+            # 2. 音频局部 FiLM 注入
+            if gamma is not None and beta is not None:
+                skip = skip * (1 + gamma) + beta
             
             out = getattr(self, 'norm_k{}'.format(i + 1))(skip)
             out = out.permute(0,2,3,1).contiguous().reshape(B*T, K, N)            
